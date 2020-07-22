@@ -30,6 +30,8 @@ static NSTimeInterval const TIMER_INTERVAL = 1.0;
 @property (copy, nonatomic) NSArray<NSString *> *contents;
 @property (nonatomic, strong) dispatch_queue_t queue;
 @property (nullable, strong, nonatomic) dispatch_source_t timer;
+@property (nonatomic, assign, getter=isObservingAddress) BOOL observingAddress;
+@property (atomic, assign, getter=isProcessing) BOOL processing;
 
 @end
 
@@ -57,51 +59,41 @@ static NSTimeInterval const TIMER_INTERVAL = 1.0;
 }
 
 - (void)startIntervalObserving {
-    if (self.timer) {
+    if (self.isObservingAddress) {
         return;
     }
 
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.queue);
-    // tolerance is of 10 percent: NSEC_PER_SEC / 10
-    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, TIMER_INTERVAL * NSEC_PER_SEC, NSEC_PER_SEC / 10);
-    dispatch_source_set_event_handler(timer, ^{
-        [self checkPasteboardContentsInternalCompletion:nil];
-    });
-    dispatch_resume(timer);
-
-    self.timer = timer;
-}
-
-- (void)stopIntervalObserving {
-    if (self.timer == nil) {
-        return;
-    }
-
-    dispatch_source_cancel(self.timer);
-
-    self.timer = nil;
-}
-
-- (void)checkPasteboardContentsCompletion:(nullable void (^)(void))completion {
-    dispatch_async(self.queue, ^{
-        [self checkPasteboardContentsInternalCompletion:completion];
-    });
-}
-
-#pragma mark Notifications
-
-- (void)applicationDidBecomeActiveNotification {
+    self.observingAddress = YES;
     [self checkPasteboardContentsCompletion:nil];
 }
 
-#pragma mark Private
+- (void)stopIntervalObserving {
+    if (self.isObservingAddress == NO) {
+        return;
+    }
 
-- (void)checkPasteboardContentsInternalCompletion:(nullable void (^)(void))completion {
-    NSAssert(![NSThread isMainThread], @"Should run on background thread");
+    self.observingAddress = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkPasteboardContentsCompletion:) object:nil];
+}
+
+- (void)checkPasteboardContentsCompletion:(nullable void (^)(void))completion {
+    NSAssert([NSThread isMainThread], @"Main thread is assumed here");
+
+    if (self.isProcessing) {
+        return;
+    }
+
+    self.processing = YES;
 
     if (self.changeCount == [UIPasteboard generalPasteboard].changeCount) {
+        self.processing = NO;
+
         if (completion) {
-            dispatch_async(dispatch_get_main_queue(), completion);
+            completion();
+        }
+
+        if (self.isObservingAddress) {
+            [self performSelector:@selector(checkPasteboardContentsCompletion:) withObject:nil afterDelay:TIMER_INTERVAL];
         }
 
         return;
@@ -125,41 +117,94 @@ static NSTimeInterval const TIMER_INTERVAL = 1.0;
 
     if (pasteboard.hasImages) {
         UIImage *img = [UIPasteboard generalPasteboard].image;
-        if (img) {
-            @synchronized([CIContext class]) {
-                NSDictionary<CIContextOption, id> *options = @{kCIContextUseSoftwareRenderer : @(YES)};
-                CIContext *context = [CIContext contextWithOptions:options];
-                if (!context) {
-                    context = [CIContext context];
-                }
+        __weak typeof(self) weakSelf = self;
+        [self addressesFromImage:img
+                      completion:^(NSArray<NSString *> *_Nonnull addresses) {
+                          __strong typeof(weakSelf) strongSelf = weakSelf;
+                          if (!strongSelf) {
+                              return;
+                          }
 
-                CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode
-                                                          context:context
-                                                          options:nil];
-                CGImageRef cgImage = img.CGImage;
-                if (detector && cgImage) {
-                    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
-                    NSArray<CIFeature *> *features = [detector featuresInImage:ciImage];
-                    for (CIQRCodeFeature *qr in features) {
-                        NSString *str = [qr.messageString stringByTrimmingCharactersInSet:whitespacesSet];
-                        if (str.length > 0) {
-                            [resultSet addObject:str];
-                        }
+                          [resultSet addObjectsFromArray:addresses];
+                          [strongSelf finishProcessingWithContents:resultSet completion:completion];
+                      }];
+    }
+    else {
+        [self finishProcessingWithContents:resultSet completion:completion];
+    }
+}
+
+#pragma mark Notifications
+
+- (void)applicationDidBecomeActiveNotification {
+    [self checkPasteboardContentsCompletion:nil];
+}
+
+#pragma mark - Private
+
+- (void)finishProcessingWithContents:(NSMutableOrderedSet<NSString *> *)resultSet
+                          completion:(nullable void (^)(void))completion {
+    NSAssert([NSThread isMainThread], @"Main thread is assumed here");
+
+    self.contents = resultSet.array;
+
+    self.processing = NO;
+
+    if (completion) {
+        completion();
+    }
+
+    [[NSNotificationCenter defaultCenter] postNotificationName:DWPasteboardObserverNotification
+                                                        object:nil];
+
+    if (self.isObservingAddress) {
+        [self performSelector:@selector(checkPasteboardContentsCompletion:) withObject:nil afterDelay:TIMER_INTERVAL];
+    }
+}
+
+- (void)addressesFromImage:(UIImage *)img completion:(void (^)(NSArray<NSString *> *addresses))completion {
+    NSAssert([NSThread isMainThread], @"Main thread is assumed here");
+
+    if (img == nil) {
+        if (completion) {
+            completion(@[]);
+        }
+
+        return;
+    }
+
+    dispatch_async(self.queue, ^{
+        NSMutableArray<NSString *> *result = [NSMutableArray array];
+
+        @synchronized([CIContext class]) {
+            NSDictionary<CIContextOption, id> *options = @{kCIContextUseSoftwareRenderer : @(YES)};
+            CIContext *context = [CIContext contextWithOptions:options];
+            if (!context) {
+                context = [CIContext context];
+            }
+
+            CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode
+                                                      context:context
+                                                      options:nil];
+            CGImageRef cgImage = img.CGImage;
+            if (detector && cgImage) {
+                NSCharacterSet *whitespacesSet = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+                CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
+                NSArray<CIFeature *> *features = [detector featuresInImage:ciImage];
+                for (CIQRCodeFeature *qr in features) {
+                    NSString *str = [qr.messageString stringByTrimmingCharactersInSet:whitespacesSet];
+                    if (str.length > 0) {
+                        [result addObject:str];
                     }
                 }
             }
         }
-    }
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.contents = resultSet.array;
-
-        if (completion) {
-            completion();
-        }
-
-        [[NSNotificationCenter defaultCenter] postNotificationName:DWPasteboardObserverNotification
-                                                            object:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) {
+                completion(result);
+            }
+        });
     });
 }
 
