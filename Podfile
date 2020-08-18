@@ -1,7 +1,7 @@
 target 'dashwallet' do
   platform :ios, '11.0'
   
-  pod 'DashSync', :git => 'https://github.com/dashevo/dashsync-iOS/', :commit => 'efe725ffa67151b3f23386354a07d76cd81e441a'
+  pod 'DashSync', :git => 'https://github.com/dashevo/dashsync-iOS/', :commit => '5c5c5428fcf4e33a00ba2036016ff216bf82aca6'
   pod 'CloudInAppMessaging', '0.1.0'
   
   pod 'KVO-MVVM', '0.5.6'
